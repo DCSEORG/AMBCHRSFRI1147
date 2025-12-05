@@ -1,0 +1,11 @@
+the following business logic must be included in the app code:
+
+* expenses cannot be larger than £999
+
+* users cannot submit more than £1500 of total expenses within a 1 hour period
+
+* travel expenses cannot be larger than £99
+
+* if a description contains 'train' then it must be set as a travel expense
+
+* if an expense date falls on a weekend then it must say (WEEKEND) in the description
