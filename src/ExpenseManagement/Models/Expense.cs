@@ -10,7 +10,7 @@ public class Expense
     public int StatusId { get; set; }
     public string StatusName { get; set; } = string.Empty;
     public int AmountMinor { get; set; }
-    public decimal AmountDisplay { get; set; }
+    public decimal AmountDisplay => AmountMinor / 100.0m;
     public string Currency { get; set; } = "GBP";
     public DateTime ExpenseDate { get; set; }
     public string? Description { get; set; }
@@ -51,7 +51,7 @@ public class ExpenseSummary
     public string StatusName { get; set; } = string.Empty;
     public int ExpenseCount { get; set; }
     public int TotalAmountMinor { get; set; }
-    public decimal TotalAmountDisplay { get; set; }
+    public decimal TotalAmountDisplay => TotalAmountMinor / 100.0m;
 }
 
 public class CategorySummary
@@ -59,5 +59,5 @@ public class CategorySummary
     public string CategoryName { get; set; } = string.Empty;
     public int ExpenseCount { get; set; }
     public int TotalAmountMinor { get; set; }
-    public decimal TotalAmountDisplay { get; set; }
+    public decimal TotalAmountDisplay => TotalAmountMinor / 100.0m;
 }

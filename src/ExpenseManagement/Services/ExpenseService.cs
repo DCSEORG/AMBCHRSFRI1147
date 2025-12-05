@@ -1,32 +1,37 @@
-using System.Data;
 using Microsoft.Data.SqlClient;
 using ExpenseManagement.Models;
+using System.Data;
 
 namespace ExpenseManagement.Services;
 
 public interface IExpenseService
 {
+    Task<List<Expense>> GetExpensesAsync(int? userId = null, int? statusId = null, int? categoryId = null, string? searchTerm = null);
+    Task<Expense?> GetExpenseByIdAsync(int expenseId);
+    Task<List<Expense>> GetPendingExpensesAsync(string? searchTerm = null);
     Task<List<ExpenseCategory>> GetCategoriesAsync();
     Task<List<ExpenseStatus>> GetStatusesAsync();
     Task<List<User>> GetUsersAsync();
     Task<User?> GetUserByIdAsync(int userId);
-    Task<List<Expense>> GetExpensesAsync(int? userId = null, int? statusId = null, int? categoryId = null, string? searchTerm = null);
-    Task<Expense?> GetExpenseByIdAsync(int expenseId);
-    Task<List<Expense>> GetPendingExpensesAsync(string? searchTerm = null);
-    Task<int> CreateExpenseAsync(int userId, int categoryId, int amountMinor, DateTime expenseDate, string? description);
-    Task<bool> UpdateExpenseAsync(int expenseId, int categoryId, int amountMinor, DateTime expenseDate, string? description);
+    Task<int> CreateExpenseAsync(CreateExpenseRequest request);
+    Task<bool> UpdateExpenseAsync(int expenseId, UpdateExpenseRequest request);
     Task<bool> SubmitExpenseAsync(int expenseId);
     Task<bool> ApproveExpenseAsync(int expenseId, int reviewerId);
     Task<bool> RejectExpenseAsync(int expenseId, int reviewerId);
     Task<bool> DeleteExpenseAsync(int expenseId);
     Task<List<ExpenseSummary>> GetExpenseSummaryAsync(int? userId = null);
     Task<List<CategorySummary>> GetExpensesByCategoryAsync(int? userId = null);
+    (bool IsValid, string? ErrorMessage) ValidateExpense(CreateExpenseRequest request);
+    Task<(bool IsValid, string? ErrorMessage)> ValidateHourlyLimitAsync(int userId, decimal amount);
 }
 
 public class ExpenseService : IExpenseService
 {
     private readonly string _connectionString;
     private readonly ILogger<ExpenseService> _logger;
+    private const decimal MaxExpenseAmount = 999m;
+    private const decimal MaxTravelExpenseAmount = 99m;
+    private const decimal HourlyLimit = 1500m;
 
     public ExpenseService(IConfiguration configuration, ILogger<ExpenseService> logger)
     {
@@ -35,387 +40,404 @@ public class ExpenseService : IExpenseService
         _logger = logger;
     }
 
-    private async Task<SqlConnection> CreateConnectionAsync()
+    public (bool IsValid, string? ErrorMessage) ValidateExpense(CreateExpenseRequest request)
     {
-        var connection = new SqlConnection(_connectionString);
+        // Business rule: expenses cannot be larger than £999
+        if (request.Amount > MaxExpenseAmount)
+        {
+            return (false, $"Expense amount cannot exceed £{MaxExpenseAmount:N2}");
+        }
+
+        // Business rule: travel expenses cannot be larger than £99
+        // CategoryId 1 is Travel based on the database schema seed data
+        if (request.CategoryId == 1 && request.Amount > MaxTravelExpenseAmount)
+        {
+            return (false, $"Travel expenses cannot exceed £{MaxTravelExpenseAmount:N2}");
+        }
+
+        return (true, null);
+    }
+
+    public async Task<(bool IsValid, string? ErrorMessage)> ValidateHourlyLimitAsync(int userId, decimal amount)
+    {
+        // Business rule: users cannot submit more than £1500 of total expenses within a 1 hour period
+        var oneHourAgo = DateTime.UtcNow.AddHours(-1);
+        
+        await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync();
-        return connection;
+
+        var query = @"
+            SELECT ISNULL(SUM(AmountMinor), 0) / 100.0
+            FROM dbo.Expenses
+            WHERE UserId = @UserId 
+              AND CreatedAt >= @OneHourAgo";
+
+        await using var command = new SqlCommand(query, connection);
+        command.Parameters.AddWithValue("@UserId", userId);
+        command.Parameters.AddWithValue("@OneHourAgo", oneHourAgo);
+
+        var result = await command.ExecuteScalarAsync();
+        var totalInLastHour = result != null && result != DBNull.Value ? Convert.ToDecimal(result) : 0m;
+
+        if (totalInLastHour + amount > HourlyLimit)
+        {
+            return (false, $"Cannot submit more than £{HourlyLimit:N2} of expenses within a 1 hour period. Current total in last hour: £{totalInLastHour:N2}");
+        }
+
+        return (true, null);
     }
 
-    public async Task<List<ExpenseCategory>> GetCategoriesAsync()
+    private static string ApplyBusinessRules(CreateExpenseRequest request, string? description)
     {
-        var categories = new List<ExpenseCategory>();
-        try
-        {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetCategories", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                categories.Add(new ExpenseCategory
-                {
-                    CategoryId = reader.GetInt32("CategoryId"),
-                    CategoryName = reader.GetString("CategoryName"),
-                    IsActive = reader.GetBoolean("IsActive")
-                });
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting categories from database");
-            throw;
-        }
-        return categories;
-    }
+        var result = description ?? string.Empty;
 
-    public async Task<List<ExpenseStatus>> GetStatusesAsync()
-    {
-        var statuses = new List<ExpenseStatus>();
-        try
-        {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetStatuses", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                statuses.Add(new ExpenseStatus
-                {
-                    StatusId = reader.GetInt32("StatusId"),
-                    StatusName = reader.GetString("StatusName")
-                });
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting statuses from database");
-            throw;
-        }
-        return statuses;
-    }
+        // Business rule: if description contains 'train' then it must be set as a travel expense
+        // This is handled in the controller by changing the category
 
-    public async Task<List<User>> GetUsersAsync()
-    {
-        var users = new List<User>();
-        try
+        // Business rule: if expense date falls on a weekend, add (WEEKEND) to description
+        if (request.ExpenseDate.DayOfWeek == DayOfWeek.Saturday || 
+            request.ExpenseDate.DayOfWeek == DayOfWeek.Sunday)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetUsers", connection)
+            if (!result.Contains("(WEEKEND)"))
             {
-                CommandType = CommandType.StoredProcedure
-            };
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                users.Add(new User
-                {
-                    UserId = reader.GetInt32("UserId"),
-                    UserName = reader.GetString("UserName"),
-                    Email = reader.GetString("Email"),
-                    RoleId = reader.GetInt32("RoleId"),
-                    RoleName = reader.GetString("RoleName"),
-                    ManagerId = reader.IsDBNull("ManagerId") ? null : reader.GetInt32("ManagerId"),
-                    IsActive = reader.GetBoolean("IsActive")
-                });
+                result = string.IsNullOrEmpty(result) ? "(WEEKEND)" : $"{result} (WEEKEND)";
             }
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting users from database");
-            throw;
-        }
-        return users;
-    }
 
-    public async Task<User?> GetUserByIdAsync(int userId)
-    {
-        try
-        {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetUserById", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@UserId", userId);
-            using var reader = await command.ExecuteReaderAsync();
-            if (await reader.ReadAsync())
-            {
-                return new User
-                {
-                    UserId = reader.GetInt32("UserId"),
-                    UserName = reader.GetString("UserName"),
-                    Email = reader.GetString("Email"),
-                    RoleId = reader.GetInt32("RoleId"),
-                    RoleName = reader.GetString("RoleName"),
-                    ManagerId = reader.IsDBNull("ManagerId") ? null : reader.GetInt32("ManagerId"),
-                    IsActive = reader.GetBoolean("IsActive")
-                };
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting user {UserId} from database", userId);
-            throw;
-        }
-        return null;
+        return result;
     }
 
     public async Task<List<Expense>> GetExpensesAsync(int? userId = null, int? statusId = null, int? categoryId = null, string? searchTerm = null)
     {
         var expenses = new List<Expense>();
-        try
+        
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetExpenses", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetExpenses", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@UserId", (object?)userId ?? DBNull.Value);
-            command.Parameters.AddWithValue("@StatusId", (object?)statusId ?? DBNull.Value);
-            command.Parameters.AddWithValue("@CategoryId", (object?)categoryId ?? DBNull.Value);
-            command.Parameters.AddWithValue("@SearchTerm", (object?)searchTerm ?? DBNull.Value);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                expenses.Add(MapExpenseFromReader(reader));
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        
+        command.Parameters.AddWithValue("@UserId", userId.HasValue ? userId.Value : DBNull.Value);
+        command.Parameters.AddWithValue("@StatusId", statusId.HasValue ? statusId.Value : DBNull.Value);
+        command.Parameters.AddWithValue("@CategoryId", categoryId.HasValue ? categoryId.Value : DBNull.Value);
+        command.Parameters.AddWithValue("@SearchTerm", string.IsNullOrEmpty(searchTerm) ? DBNull.Value : searchTerm);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error getting expenses from database");
-            throw;
+            expenses.Add(MapExpenseFromReader(reader));
         }
+
         return expenses;
     }
 
     public async Task<Expense?> GetExpenseByIdAsync(int expenseId)
     {
-        try
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetExpenseById", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetExpenseById", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@ExpenseId", expenseId);
-            using var reader = await command.ExecuteReaderAsync();
-            if (await reader.ReadAsync())
-            {
-                return MapExpenseFromReader(reader);
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@ExpenseId", expenseId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error getting expense {ExpenseId} from database", expenseId);
-            throw;
+            return MapExpenseFromReader(reader);
         }
+
         return null;
     }
 
     public async Task<List<Expense>> GetPendingExpensesAsync(string? searchTerm = null)
     {
         var expenses = new List<Expense>();
-        try
+        
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetPendingExpenses", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetPendingExpenses", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@SearchTerm", (object?)searchTerm ?? DBNull.Value);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                expenses.Add(new Expense
-                {
-                    ExpenseId = reader.GetInt32("ExpenseId"),
-                    UserId = reader.GetInt32("UserId"),
-                    UserName = reader.GetString("UserName"),
-                    CategoryId = reader.GetInt32("CategoryId"),
-                    CategoryName = reader.GetString("CategoryName"),
-                    StatusId = reader.GetInt32("StatusId"),
-                    StatusName = reader.GetString("StatusName"),
-                    AmountMinor = reader.GetInt32("AmountMinor"),
-                    AmountDisplay = reader.GetDecimal("AmountDisplay"),
-                    Currency = reader.GetString("Currency"),
-                    ExpenseDate = reader.GetDateTime("ExpenseDate"),
-                    Description = reader.IsDBNull("Description") ? null : reader.GetString("Description"),
-                    SubmittedAt = reader.IsDBNull("SubmittedAt") ? null : reader.GetDateTime("SubmittedAt")
-                });
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@SearchTerm", string.IsNullOrEmpty(searchTerm) ? DBNull.Value : searchTerm);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error getting pending expenses from database");
-            throw;
+            expenses.Add(new Expense
+            {
+                ExpenseId = reader.GetInt32("ExpenseId"),
+                UserId = reader.GetInt32("UserId"),
+                UserName = reader.GetString("UserName"),
+                CategoryId = reader.GetInt32("CategoryId"),
+                CategoryName = reader.GetString("CategoryName"),
+                StatusId = reader.GetInt32("StatusId"),
+                StatusName = reader.GetString("StatusName"),
+                AmountMinor = reader.GetInt32("AmountMinor"),
+                Currency = reader.GetString("Currency"),
+                ExpenseDate = reader.GetDateTime("ExpenseDate"),
+                Description = reader.IsDBNull("Description") ? null : reader.GetString("Description"),
+                SubmittedAt = reader.IsDBNull("SubmittedAt") ? null : reader.GetDateTime("SubmittedAt")
+            });
         }
+
         return expenses;
     }
 
-    public async Task<int> CreateExpenseAsync(int userId, int categoryId, int amountMinor, DateTime expenseDate, string? description)
+    public async Task<List<ExpenseCategory>> GetCategoriesAsync()
     {
-        try
+        var categories = new List<ExpenseCategory>();
+        
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetCategories", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_CreateExpense", connection)
+            CommandType = CommandType.StoredProcedure
+        };
+
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            categories.Add(new ExpenseCategory
             {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@UserId", userId);
-            command.Parameters.AddWithValue("@CategoryId", categoryId);
-            command.Parameters.AddWithValue("@AmountMinor", amountMinor);
-            command.Parameters.AddWithValue("@ExpenseDate", expenseDate);
-            command.Parameters.AddWithValue("@Description", (object?)description ?? DBNull.Value);
-            command.Parameters.AddWithValue("@ReceiptFile", DBNull.Value);
-            
-            var outputParam = command.Parameters.Add("@ExpenseId", SqlDbType.Int);
-            outputParam.Direction = ParameterDirection.Output;
-            
-            await command.ExecuteNonQueryAsync();
-            return (int)outputParam.Value;
+                CategoryId = reader.GetInt32("CategoryId"),
+                CategoryName = reader.GetString("CategoryName"),
+                IsActive = reader.GetBoolean("IsActive")
+            });
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error creating expense in database");
-            throw;
-        }
+
+        return categories;
     }
 
-    public async Task<bool> UpdateExpenseAsync(int expenseId, int categoryId, int amountMinor, DateTime expenseDate, string? description)
+    public async Task<List<ExpenseStatus>> GetStatusesAsync()
     {
-        try
+        var statuses = new List<ExpenseStatus>();
+        
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetStatuses", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_UpdateExpense", connection)
+            CommandType = CommandType.StoredProcedure
+        };
+
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            statuses.Add(new ExpenseStatus
             {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@ExpenseId", expenseId);
-            command.Parameters.AddWithValue("@CategoryId", categoryId);
-            command.Parameters.AddWithValue("@AmountMinor", amountMinor);
-            command.Parameters.AddWithValue("@ExpenseDate", expenseDate);
-            command.Parameters.AddWithValue("@Description", (object?)description ?? DBNull.Value);
-            command.Parameters.AddWithValue("@ReceiptFile", DBNull.Value);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            if (await reader.ReadAsync())
-            {
-                return reader.GetInt32("RowsAffected") > 0;
-            }
+                StatusId = reader.GetInt32("StatusId"),
+                StatusName = reader.GetString("StatusName")
+            });
         }
-        catch (Exception ex)
+
+        return statuses;
+    }
+
+    public async Task<List<User>> GetUsersAsync()
+    {
+        var users = new List<User>();
+        
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetUsers", connection)
         {
-            _logger.LogError(ex, "Error updating expense {ExpenseId} in database", expenseId);
-            throw;
+            CommandType = CommandType.StoredProcedure
+        };
+
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            users.Add(new User
+            {
+                UserId = reader.GetInt32("UserId"),
+                UserName = reader.GetString("UserName"),
+                Email = reader.GetString("Email"),
+                RoleId = reader.GetInt32("RoleId"),
+                RoleName = reader.GetString("RoleName"),
+                ManagerId = reader.IsDBNull("ManagerId") ? null : reader.GetInt32("ManagerId"),
+                IsActive = reader.GetBoolean("IsActive")
+            });
+        }
+
+        return users;
+    }
+
+    public async Task<User?> GetUserByIdAsync(int userId)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetUserById", connection)
+        {
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@UserId", userId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            return new User
+            {
+                UserId = reader.GetInt32("UserId"),
+                UserName = reader.GetString("UserName"),
+                Email = reader.GetString("Email"),
+                RoleId = reader.GetInt32("RoleId"),
+                RoleName = reader.GetString("RoleName"),
+                ManagerId = reader.IsDBNull("ManagerId") ? null : reader.GetInt32("ManagerId"),
+                IsActive = reader.GetBoolean("IsActive")
+            };
+        }
+
+        return null;
+    }
+
+    public async Task<int> CreateExpenseAsync(CreateExpenseRequest request)
+    {
+        // Apply business rules
+        var categoryId = request.CategoryId;
+        
+        // Business rule: if description contains 'train' then it must be set as a travel expense
+        if (!string.IsNullOrEmpty(request.Description) && 
+            request.Description.Contains("train", StringComparison.OrdinalIgnoreCase))
+        {
+            categoryId = 1; // Travel category
+        }
+
+        var description = ApplyBusinessRules(request, request.Description);
+        var amountMinor = (int)(request.Amount * 100);
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_CreateExpense", connection)
+        {
+            CommandType = CommandType.StoredProcedure
+        };
+        
+        command.Parameters.AddWithValue("@UserId", request.UserId);
+        command.Parameters.AddWithValue("@CategoryId", categoryId);
+        command.Parameters.AddWithValue("@AmountMinor", amountMinor);
+        command.Parameters.AddWithValue("@ExpenseDate", request.ExpenseDate);
+        command.Parameters.AddWithValue("@Description", string.IsNullOrEmpty(description) ? DBNull.Value : description);
+        command.Parameters.AddWithValue("@ReceiptFile", string.IsNullOrEmpty(request.ReceiptFile) ? DBNull.Value : request.ReceiptFile);
+        
+        var outputParam = new SqlParameter("@ExpenseId", SqlDbType.Int) { Direction = ParameterDirection.Output };
+        command.Parameters.Add(outputParam);
+
+        await command.ExecuteNonQueryAsync();
+        
+        return (int)outputParam.Value;
+    }
+
+    public async Task<bool> UpdateExpenseAsync(int expenseId, UpdateExpenseRequest request)
+    {
+        var amountMinor = (int)(request.Amount * 100);
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_UpdateExpense", connection)
+        {
+            CommandType = CommandType.StoredProcedure
+        };
+        
+        command.Parameters.AddWithValue("@ExpenseId", expenseId);
+        command.Parameters.AddWithValue("@CategoryId", request.CategoryId);
+        command.Parameters.AddWithValue("@AmountMinor", amountMinor);
+        command.Parameters.AddWithValue("@ExpenseDate", request.ExpenseDate);
+        command.Parameters.AddWithValue("@Description", string.IsNullOrEmpty(request.Description) ? DBNull.Value : request.Description);
+        command.Parameters.AddWithValue("@ReceiptFile", string.IsNullOrEmpty(request.ReceiptFile) ? DBNull.Value : request.ReceiptFile);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            return reader.GetInt32("RowsAffected") > 0;
         }
         return false;
     }
 
     public async Task<bool> SubmitExpenseAsync(int expenseId)
     {
-        try
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_SubmitExpense", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_SubmitExpense", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@ExpenseId", expenseId);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            if (await reader.ReadAsync())
-            {
-                return reader.GetInt32("RowsAffected") > 0;
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@ExpenseId", expenseId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error submitting expense {ExpenseId}", expenseId);
-            throw;
+            return reader.GetInt32("RowsAffected") > 0;
         }
         return false;
     }
 
     public async Task<bool> ApproveExpenseAsync(int expenseId, int reviewerId)
     {
-        try
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_ApproveExpense", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_ApproveExpense", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@ExpenseId", expenseId);
-            command.Parameters.AddWithValue("@ReviewerId", reviewerId);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            if (await reader.ReadAsync())
-            {
-                return reader.GetInt32("RowsAffected") > 0;
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@ExpenseId", expenseId);
+        command.Parameters.AddWithValue("@ReviewerId", reviewerId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error approving expense {ExpenseId}", expenseId);
-            throw;
+            return reader.GetInt32("RowsAffected") > 0;
         }
         return false;
     }
 
     public async Task<bool> RejectExpenseAsync(int expenseId, int reviewerId)
     {
-        try
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_RejectExpense", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_RejectExpense", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@ExpenseId", expenseId);
-            command.Parameters.AddWithValue("@ReviewerId", reviewerId);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            if (await reader.ReadAsync())
-            {
-                return reader.GetInt32("RowsAffected") > 0;
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@ExpenseId", expenseId);
+        command.Parameters.AddWithValue("@ReviewerId", reviewerId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error rejecting expense {ExpenseId}", expenseId);
-            throw;
+            return reader.GetInt32("RowsAffected") > 0;
         }
         return false;
     }
 
     public async Task<bool> DeleteExpenseAsync(int expenseId)
     {
-        try
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_DeleteExpense", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_DeleteExpense", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@ExpenseId", expenseId);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            if (await reader.ReadAsync())
-            {
-                return reader.GetInt32("RowsAffected") > 0;
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@ExpenseId", expenseId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error deleting expense {ExpenseId}", expenseId);
-            throw;
+            return reader.GetInt32("RowsAffected") > 0;
         }
         return false;
     }
@@ -423,64 +445,54 @@ public class ExpenseService : IExpenseService
     public async Task<List<ExpenseSummary>> GetExpenseSummaryAsync(int? userId = null)
     {
         var summaries = new List<ExpenseSummary>();
-        try
+        
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetExpenseSummary", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetExpenseSummary", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@UserId", (object?)userId ?? DBNull.Value);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                summaries.Add(new ExpenseSummary
-                {
-                    StatusName = reader.GetString("StatusName"),
-                    ExpenseCount = reader.GetInt32("ExpenseCount"),
-                    TotalAmountMinor = reader.GetInt32("TotalAmountMinor"),
-                    TotalAmountDisplay = reader.GetDecimal("TotalAmountDisplay")
-                });
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@UserId", userId.HasValue ? userId.Value : DBNull.Value);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error getting expense summary from database");
-            throw;
+            summaries.Add(new ExpenseSummary
+            {
+                StatusName = reader.GetString("StatusName"),
+                ExpenseCount = reader.GetInt32("ExpenseCount"),
+                TotalAmountMinor = reader.IsDBNull("TotalAmountMinor") ? 0 : reader.GetInt32("TotalAmountMinor")
+            });
         }
+
         return summaries;
     }
 
     public async Task<List<CategorySummary>> GetExpensesByCategoryAsync(int? userId = null)
     {
         var summaries = new List<CategorySummary>();
-        try
+        
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new SqlCommand("usp_GetExpensesByCategory", connection)
         {
-            using var connection = await CreateConnectionAsync();
-            using var command = new SqlCommand("usp_GetExpensesByCategory", connection)
-            {
-                CommandType = CommandType.StoredProcedure
-            };
-            command.Parameters.AddWithValue("@UserId", (object?)userId ?? DBNull.Value);
-            
-            using var reader = await command.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-            {
-                summaries.Add(new CategorySummary
-                {
-                    CategoryName = reader.GetString("CategoryName"),
-                    ExpenseCount = reader.GetInt32("ExpenseCount"),
-                    TotalAmountMinor = reader.GetInt32("TotalAmountMinor"),
-                    TotalAmountDisplay = reader.GetDecimal("TotalAmountDisplay")
-                });
-            }
-        }
-        catch (Exception ex)
+            CommandType = CommandType.StoredProcedure
+        };
+        command.Parameters.AddWithValue("@UserId", userId.HasValue ? userId.Value : DBNull.Value);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            _logger.LogError(ex, "Error getting expenses by category from database");
-            throw;
+            summaries.Add(new CategorySummary
+            {
+                CategoryName = reader.GetString("CategoryName"),
+                ExpenseCount = reader.GetInt32("ExpenseCount"),
+                TotalAmountMinor = reader.IsDBNull("TotalAmountMinor") ? 0 : reader.GetInt32("TotalAmountMinor")
+            });
         }
+
         return summaries;
     }
 
@@ -496,7 +508,6 @@ public class ExpenseService : IExpenseService
             StatusId = reader.GetInt32("StatusId"),
             StatusName = reader.GetString("StatusName"),
             AmountMinor = reader.GetInt32("AmountMinor"),
-            AmountDisplay = reader.GetDecimal("AmountDisplay"),
             Currency = reader.GetString("Currency"),
             ExpenseDate = reader.GetDateTime("ExpenseDate"),
             Description = reader.IsDBNull("Description") ? null : reader.GetString("Description"),

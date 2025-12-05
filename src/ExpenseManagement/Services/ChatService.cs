@@ -1,17 +1,17 @@
+using Azure;
 using Azure.AI.OpenAI;
 using Azure.Identity;
+using ExpenseManagement.Models;
 using OpenAI.Chat;
 using System.Text.Json;
-using ChatMessageModel = ExpenseManagement.Models.ChatMessage;
-using ChatRequestModel = ExpenseManagement.Models.ChatRequest;
-using ChatResponseModel = ExpenseManagement.Models.ChatResponse;
+using OpenAIChatMessage = OpenAI.Chat.ChatMessage;
 
 namespace ExpenseManagement.Services;
 
 public interface IChatService
 {
-    Task<ChatResponseModel> GetResponseAsync(ChatRequestModel request);
-    bool IsEnabled { get; }
+    Task<ChatResponse> SendMessageAsync(ChatRequest request);
+    bool IsConfigured { get; }
 }
 
 public class ChatService : IChatService
@@ -19,61 +19,70 @@ public class ChatService : IChatService
     private readonly IConfiguration _configuration;
     private readonly IExpenseService _expenseService;
     private readonly ILogger<ChatService> _logger;
-    private readonly string? _endpoint;
+    private readonly AzureOpenAIClient? _client;
     private readonly string? _deploymentName;
-    private readonly string? _managedIdentityClientId;
 
-    public bool IsEnabled => !string.IsNullOrEmpty(_endpoint) && !string.IsNullOrEmpty(_deploymentName);
+    public bool IsConfigured => _client != null && !string.IsNullOrEmpty(_deploymentName);
 
-    public ChatService(
-        IConfiguration configuration,
-        IExpenseService expenseService,
-        ILogger<ChatService> logger)
+    public ChatService(IConfiguration configuration, IExpenseService expenseService, ILogger<ChatService> logger)
     {
         _configuration = configuration;
         _expenseService = expenseService;
         _logger = logger;
-        _endpoint = configuration["OpenAI:Endpoint"];
+
+        var endpoint = configuration["OpenAI:Endpoint"];
         _deploymentName = configuration["OpenAI:DeploymentName"];
-        _managedIdentityClientId = configuration["ManagedIdentityClientId"];
+
+        if (!string.IsNullOrEmpty(endpoint) && !string.IsNullOrEmpty(_deploymentName))
+        {
+            try
+            {
+                var managedIdentityClientId = configuration["ManagedIdentityClientId"];
+                Azure.Core.TokenCredential credential;
+
+                if (!string.IsNullOrEmpty(managedIdentityClientId))
+                {
+                    _logger.LogInformation("Using ManagedIdentityCredential with client ID: {ClientId}", managedIdentityClientId);
+                    credential = new ManagedIdentityCredential(managedIdentityClientId);
+                }
+                else
+                {
+                    _logger.LogInformation("Using DefaultAzureCredential");
+                    credential = new DefaultAzureCredential();
+                }
+
+                _client = new AzureOpenAIClient(new Uri(endpoint), credential);
+                _logger.LogInformation("Azure OpenAI client initialized with endpoint: {Endpoint}", endpoint);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to initialize Azure OpenAI client");
+            }
+        }
+        else
+        {
+            _logger.LogWarning("Azure OpenAI is not configured. Set OpenAI:Endpoint and OpenAI:DeploymentName in configuration.");
+        }
     }
 
-    public async Task<ChatResponseModel> GetResponseAsync(ChatRequestModel request)
+    public async Task<ChatResponse> SendMessageAsync(ChatRequest request)
     {
-        if (!IsEnabled)
+        if (!IsConfigured)
         {
-            return new ChatResponseModel
+            return new ChatResponse
             {
-                Success = true,
-                IsGenAIEnabled = false,
-                Message = "GenAI services are not configured. To enable the AI assistant, deploy the application using 'deploy-with-chat.sh' which provisions Azure OpenAI and AI Search resources. " +
-                         "This allows you to interact with your expense data using natural language queries like 'Show me all pending expenses' or 'Create a new travel expense for £50'."
+                Success = false,
+                Error = "Azure OpenAI is not configured. Deploy with the -DeployGenAI switch to enable chat functionality."
             };
         }
 
         try
         {
-            Azure.Core.TokenCredential credential;
-            if (!string.IsNullOrEmpty(_managedIdentityClientId))
+            var chatClient = _client!.GetChatClient(_deploymentName);
+            
+            var messages = new List<OpenAIChatMessage>
             {
-                _logger.LogInformation("Using ManagedIdentityCredential with client ID: {ClientId}", _managedIdentityClientId);
-                credential = new ManagedIdentityCredential(_managedIdentityClientId);
-            }
-            else
-            {
-                _logger.LogInformation("Using DefaultAzureCredential");
-                credential = new DefaultAzureCredential();
-            }
-
-            var client = new AzureOpenAIClient(new Uri(_endpoint!), credential);
-            var chatClient = client.GetChatClient(_deploymentName);
-
-            var tools = GetFunctionTools();
-            var systemMessage = GetSystemPrompt();
-
-            var messages = new List<OpenAI.Chat.ChatMessage>
-            {
-                new SystemChatMessage(systemMessage)
+                new SystemChatMessage(GetSystemPrompt())
             };
 
             // Add conversation history
@@ -88,320 +97,265 @@ public class ChatService : IChatService
             // Add current message
             messages.Add(new UserChatMessage(request.Message));
 
-            var options = new ChatCompletionOptions();
-            foreach (var tool in tools)
+            var options = new ChatCompletionOptions
             {
-                options.Tools.Add(tool);
-            }
+                Tools = { GetExpensesTool(), CreateExpenseTool(), GetCategoriesTool(), GetPendingExpensesTool(), ApproveExpenseTool() }
+            };
 
-            // Function calling loop
-            var maxIterations = 10;
-            var iteration = 0;
-
-            while (iteration < maxIterations)
-            {
-                iteration++;
-                var response = await chatClient.CompleteChatAsync(messages, options);
-                var completion = response.Value;
-
-                if (completion.FinishReason == ChatFinishReason.Stop)
-                {
-                    var content = completion.Content.FirstOrDefault()?.Text ?? "I couldn't generate a response.";
-                    return new ChatResponseModel
-                    {
-                        Success = true,
-                        IsGenAIEnabled = true,
-                        Message = content
-                    };
-                }
-
-                if (completion.FinishReason == ChatFinishReason.ToolCalls)
-                {
-                    var assistantMessage = new AssistantChatMessage(completion);
-                    messages.Add(assistantMessage);
-
-                    foreach (var toolCall in completion.ToolCalls)
-                    {
-                        var result = await ExecuteFunctionAsync(toolCall);
-                        messages.Add(new ToolChatMessage(toolCall.Id, result));
-                    }
-                }
-                else
-                {
-                    break;
-                }
-            }
-
-            return new ChatResponseModel
+            var response = await ProcessChatWithToolsAsync(chatClient, messages, options);
+            
+            return new ChatResponse
             {
                 Success = true,
-                IsGenAIEnabled = true,
-                Message = "I completed processing your request."
+                Message = response
             };
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error in chat service");
-            return new ChatResponseModel
+            _logger.LogError(ex, "Error sending message to Azure OpenAI");
+            return new ChatResponse
             {
                 Success = false,
-                IsGenAIEnabled = true,
-                Error = $"Error communicating with AI service: {ex.Message}"
+                Error = $"Error communicating with AI: {ex.Message}"
             };
         }
     }
 
-    private string GetSystemPrompt()
+    private async Task<string> ProcessChatWithToolsAsync(ChatClient chatClient, List<OpenAIChatMessage> messages, ChatCompletionOptions options)
     {
-        return """
-            You are a helpful assistant for an Expense Management System. You can help users:
-            - View and filter expenses
-            - Create new expenses
-            - Submit expenses for approval
-            - Approve or reject expenses (for managers)
-            - Get summaries and reports
+        const int maxIterations = 10;
+        var iteration = 0;
 
-            When listing expenses or other data, format the output nicely with:
-            - Use **bold** for headers and important values
-            - Use numbered lists (1. 2. 3.) for expense items
-            - Include relevant details like date, category, amount, and status
-            - Format amounts with the £ symbol
-
-            Available functions allow you to:
-            - get_expenses: List expenses with optional filters (userId, statusId, categoryId, searchTerm)
-            - get_pending_expenses: List expenses waiting for approval
-            - get_expense_by_id: Get details of a specific expense
-            - create_expense: Create a new expense (requires userId, categoryId, amount, expenseDate, description)
-            - submit_expense: Submit an expense for approval
-            - approve_expense: Approve a pending expense (requires reviewerId)
-            - reject_expense: Reject a pending expense (requires reviewerId)
-            - get_categories: List available expense categories
-            - get_users: List users in the system
-            - get_expense_summary: Get summary statistics by status
-            - get_expenses_by_category: Get summary statistics by category
-
-            Always be helpful and provide clear responses. If an operation fails, explain what went wrong.
-            """;
-    }
-
-    private List<ChatTool> GetFunctionTools()
-    {
-        return new List<ChatTool>
+        while (iteration < maxIterations)
         {
-            ChatTool.CreateFunctionTool("get_expenses", "Get a list of expenses with optional filters",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "userId": { "type": "integer", "description": "Filter by user ID" },
-                        "statusId": { "type": "integer", "description": "Filter by status ID (1=Draft, 2=Submitted, 3=Approved, 4=Rejected)" },
-                        "categoryId": { "type": "integer", "description": "Filter by category ID" },
-                        "searchTerm": { "type": "string", "description": "Search term for description" }
-                    }
-                }
-                """)),
+            iteration++;
+            var response = await chatClient.CompleteChatAsync(messages, options);
+            var result = response.Value;
 
-            ChatTool.CreateFunctionTool("get_pending_expenses", "Get expenses pending approval",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "searchTerm": { "type": "string", "description": "Optional search term" }
-                    }
-                }
-                """)),
+            if (result.FinishReason == ChatFinishReason.Stop)
+            {
+                return result.Content.FirstOrDefault()?.Text ?? "I'm sorry, I couldn't generate a response.";
+            }
 
-            ChatTool.CreateFunctionTool("get_expense_by_id", "Get details of a specific expense",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "expenseId": { "type": "integer", "description": "The expense ID" }
-                    },
-                    "required": ["expenseId"]
-                }
-                """)),
+            if (result.FinishReason == ChatFinishReason.ToolCalls)
+            {
+                messages.Add(new AssistantChatMessage(result));
 
-            ChatTool.CreateFunctionTool("create_expense", "Create a new expense",
-                BinaryData.FromString("""
+                foreach (var toolCall in result.ToolCalls)
                 {
-                    "type": "object",
-                    "properties": {
-                        "userId": { "type": "integer", "description": "User ID creating the expense" },
-                        "categoryId": { "type": "integer", "description": "Category ID (1=Travel, 2=Meals, 3=Supplies, 4=Accommodation, 5=Other)" },
-                        "amount": { "type": "number", "description": "Amount in GBP (e.g., 25.50)" },
-                        "expenseDate": { "type": "string", "description": "Expense date in YYYY-MM-DD format" },
-                        "description": { "type": "string", "description": "Description of the expense" }
-                    },
-                    "required": ["userId", "categoryId", "amount", "expenseDate"]
+                    var toolResult = await ExecuteToolAsync(toolCall);
+                    messages.Add(new ToolChatMessage(toolCall.Id, toolResult));
                 }
-                """)),
+            }
+            else
+            {
+                return result.Content.FirstOrDefault()?.Text ?? "I'm sorry, I couldn't generate a response.";
+            }
+        }
 
-            ChatTool.CreateFunctionTool("submit_expense", "Submit an expense for approval",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "expenseId": { "type": "integer", "description": "The expense ID to submit" }
-                    },
-                    "required": ["expenseId"]
-                }
-                """)),
-
-            ChatTool.CreateFunctionTool("approve_expense", "Approve a pending expense",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "expenseId": { "type": "integer", "description": "The expense ID to approve" },
-                        "reviewerId": { "type": "integer", "description": "The manager's user ID" }
-                    },
-                    "required": ["expenseId", "reviewerId"]
-                }
-                """)),
-
-            ChatTool.CreateFunctionTool("reject_expense", "Reject a pending expense",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "expenseId": { "type": "integer", "description": "The expense ID to reject" },
-                        "reviewerId": { "type": "integer", "description": "The manager's user ID" }
-                    },
-                    "required": ["expenseId", "reviewerId"]
-                }
-                """)),
-
-            ChatTool.CreateFunctionTool("get_categories", "Get list of expense categories",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {}
-                }
-                """)),
-
-            ChatTool.CreateFunctionTool("get_users", "Get list of users",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {}
-                }
-                """)),
-
-            ChatTool.CreateFunctionTool("get_expense_summary", "Get expense summary by status",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "userId": { "type": "integer", "description": "Optional user ID to filter by" }
-                    }
-                }
-                """)),
-
-            ChatTool.CreateFunctionTool("get_expenses_by_category", "Get expense summary by category",
-                BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "userId": { "type": "integer", "description": "Optional user ID to filter by" }
-                    }
-                }
-                """))
-        };
+        return "I'm sorry, I reached the maximum number of operations. Please try a simpler request.";
     }
 
-    private async Task<string> ExecuteFunctionAsync(ChatToolCall toolCall)
+    private async Task<string> ExecuteToolAsync(ChatToolCall toolCall)
     {
         try
         {
-            var functionName = toolCall.FunctionName;
-            var arguments = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(toolCall.FunctionArguments.ToString()) 
-                ?? new Dictionary<string, JsonElement>();
+            _logger.LogInformation("Executing tool: {ToolName} with arguments: {Arguments}", toolCall.FunctionName, toolCall.FunctionArguments);
 
-            _logger.LogInformation("Executing function: {Function} with args: {Args}", functionName, toolCall.FunctionArguments);
-
-            return functionName switch
+            return toolCall.FunctionName switch
             {
-                "get_expenses" => JsonSerializer.Serialize(await _expenseService.GetExpensesAsync(
-                    GetIntArg(arguments, "userId"),
-                    GetIntArg(arguments, "statusId"),
-                    GetIntArg(arguments, "categoryId"),
-                    GetStringArg(arguments, "searchTerm"))),
-
-                "get_pending_expenses" => JsonSerializer.Serialize(await _expenseService.GetPendingExpensesAsync(
-                    GetStringArg(arguments, "searchTerm"))),
-
-                "get_expense_by_id" => JsonSerializer.Serialize(await _expenseService.GetExpenseByIdAsync(
-                    GetIntArg(arguments, "expenseId") ?? throw new ArgumentException("expenseId is required"))),
-
-                "create_expense" => await CreateExpenseAsync(arguments),
-
-                "submit_expense" => JsonSerializer.Serialize(new { success = await _expenseService.SubmitExpenseAsync(
-                    GetIntArg(arguments, "expenseId") ?? throw new ArgumentException("expenseId is required")) }),
-
-                "approve_expense" => JsonSerializer.Serialize(new { success = await _expenseService.ApproveExpenseAsync(
-                    GetIntArg(arguments, "expenseId") ?? throw new ArgumentException("expenseId is required"),
-                    GetIntArg(arguments, "reviewerId") ?? throw new ArgumentException("reviewerId is required")) }),
-
-                "reject_expense" => JsonSerializer.Serialize(new { success = await _expenseService.RejectExpenseAsync(
-                    GetIntArg(arguments, "expenseId") ?? throw new ArgumentException("expenseId is required"),
-                    GetIntArg(arguments, "reviewerId") ?? throw new ArgumentException("reviewerId is required")) }),
-
-                "get_categories" => JsonSerializer.Serialize(await _expenseService.GetCategoriesAsync()),
-
-                "get_users" => JsonSerializer.Serialize(await _expenseService.GetUsersAsync()),
-
-                "get_expense_summary" => JsonSerializer.Serialize(await _expenseService.GetExpenseSummaryAsync(
-                    GetIntArg(arguments, "userId"))),
-
-                "get_expenses_by_category" => JsonSerializer.Serialize(await _expenseService.GetExpensesByCategoryAsync(
-                    GetIntArg(arguments, "userId"))),
-
-                _ => JsonSerializer.Serialize(new { error = $"Unknown function: {functionName}" })
+                "get_expenses" => await HandleGetExpensesAsync(toolCall.FunctionArguments.ToString()),
+                "create_expense" => await HandleCreateExpenseAsync(toolCall.FunctionArguments.ToString()),
+                "get_categories" => await HandleGetCategoriesAsync(),
+                "get_pending_expenses" => await HandleGetPendingExpensesAsync(),
+                "approve_expense" => await HandleApproveExpenseAsync(toolCall.FunctionArguments.ToString()),
+                _ => JsonSerializer.Serialize(new { error = $"Unknown tool: {toolCall.FunctionName}" })
             };
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error executing function {Function}", toolCall.FunctionName);
+            _logger.LogError(ex, "Error executing tool {ToolName}", toolCall.FunctionName);
             return JsonSerializer.Serialize(new { error = ex.Message });
         }
     }
 
-    private async Task<string> CreateExpenseAsync(Dictionary<string, JsonElement> arguments)
+    private async Task<string> HandleGetExpensesAsync(string arguments)
     {
-        var userId = GetIntArg(arguments, "userId") ?? throw new ArgumentException("userId is required");
-        var categoryId = GetIntArg(arguments, "categoryId") ?? throw new ArgumentException("categoryId is required");
-        var amount = GetDecimalArg(arguments, "amount") ?? throw new ArgumentException("amount is required");
-        var dateStr = GetStringArg(arguments, "expenseDate") ?? throw new ArgumentException("expenseDate is required");
-        var description = GetStringArg(arguments, "description");
+        var args = JsonSerializer.Deserialize<JsonElement>(arguments);
+        int? userId = args.TryGetProperty("userId", out var userIdProp) ? userIdProp.GetInt32() : null;
+        string? searchTerm = args.TryGetProperty("searchTerm", out var searchProp) ? searchProp.GetString() : null;
 
-        if (!DateTime.TryParse(dateStr, out var expenseDate))
-            throw new ArgumentException("Invalid date format");
+        var expenses = await _expenseService.GetExpensesAsync(userId: userId, searchTerm: searchTerm);
+        
+        var result = expenses.Select(e => new
+        {
+            e.ExpenseId,
+            e.UserName,
+            e.CategoryName,
+            Amount = $"£{e.AmountDisplay:N2}",
+            Date = e.ExpenseDate.ToString("dd/MM/yyyy"),
+            e.StatusName,
+            e.Description
+        });
 
-        var amountMinor = (int)(amount * 100);
-        var expenseId = await _expenseService.CreateExpenseAsync(userId, categoryId, amountMinor, expenseDate, description);
-
-        return JsonSerializer.Serialize(new { success = true, expenseId });
+        return JsonSerializer.Serialize(result);
     }
 
-    private static int? GetIntArg(Dictionary<string, JsonElement> args, string key)
+    private async Task<string> HandleCreateExpenseAsync(string arguments)
     {
-        if (args.TryGetValue(key, out var element) && element.ValueKind == JsonValueKind.Number)
-            return element.GetInt32();
-        return null;
+        var args = JsonSerializer.Deserialize<JsonElement>(arguments);
+        
+        var request = new CreateExpenseRequest
+        {
+            UserId = args.TryGetProperty("userId", out var userIdProp) ? userIdProp.GetInt32() : 1,
+            CategoryId = args.TryGetProperty("categoryId", out var catProp) ? catProp.GetInt32() : 5,
+            Amount = args.TryGetProperty("amount", out var amountProp) ? amountProp.GetDecimal() : 0,
+            ExpenseDate = args.TryGetProperty("date", out var dateProp) && DateTime.TryParse(dateProp.GetString(), out var date) ? date : DateTime.Today,
+            Description = args.TryGetProperty("description", out var descProp) ? descProp.GetString() : null
+        };
+
+        var validation = _expenseService.ValidateExpense(request);
+        if (!validation.IsValid)
+        {
+            return JsonSerializer.Serialize(new { success = false, error = validation.ErrorMessage });
+        }
+
+        var hourlyValidation = await _expenseService.ValidateHourlyLimitAsync(request.UserId, request.Amount);
+        if (!hourlyValidation.IsValid)
+        {
+            return JsonSerializer.Serialize(new { success = false, error = hourlyValidation.ErrorMessage });
+        }
+
+        var expenseId = await _expenseService.CreateExpenseAsync(request);
+        return JsonSerializer.Serialize(new { success = true, expenseId, message = $"Expense created with ID {expenseId}" });
     }
 
-    private static string? GetStringArg(Dictionary<string, JsonElement> args, string key)
+    private async Task<string> HandleGetCategoriesAsync()
     {
-        if (args.TryGetValue(key, out var element) && element.ValueKind == JsonValueKind.String)
-            return element.GetString();
-        return null;
+        var categories = await _expenseService.GetCategoriesAsync();
+        return JsonSerializer.Serialize(categories.Select(c => new { c.CategoryId, c.CategoryName }));
     }
 
-    private static decimal? GetDecimalArg(Dictionary<string, JsonElement> args, string key)
+    private async Task<string> HandleGetPendingExpensesAsync()
     {
-        if (args.TryGetValue(key, out var element) && element.ValueKind == JsonValueKind.Number)
-            return element.GetDecimal();
-        return null;
+        var expenses = await _expenseService.GetPendingExpensesAsync();
+        var result = expenses.Select(e => new
+        {
+            e.ExpenseId,
+            e.UserName,
+            e.CategoryName,
+            Amount = $"£{e.AmountDisplay:N2}",
+            Date = e.ExpenseDate.ToString("dd/MM/yyyy"),
+            e.Description
+        });
+
+        return JsonSerializer.Serialize(result);
+    }
+
+    private async Task<string> HandleApproveExpenseAsync(string arguments)
+    {
+        var args = JsonSerializer.Deserialize<JsonElement>(arguments);
+        
+        var expenseId = args.TryGetProperty("expenseId", out var expProp) ? expProp.GetInt32() : 0;
+        var reviewerId = args.TryGetProperty("reviewerId", out var revProp) ? revProp.GetInt32() : 2;
+
+        if (expenseId == 0)
+        {
+            return JsonSerializer.Serialize(new { success = false, error = "Expense ID is required" });
+        }
+
+        var success = await _expenseService.ApproveExpenseAsync(expenseId, reviewerId);
+        return JsonSerializer.Serialize(new { success, message = success ? $"Expense {expenseId} approved" : "Failed to approve expense" });
+    }
+
+    private static string GetSystemPrompt()
+    {
+        return @"You are an AI assistant for the Expense Management System. You help users manage their expenses.
+
+Available functions:
+- get_expenses: Retrieve expenses from the database. Can filter by userId or searchTerm.
+- create_expense: Create a new expense. Requires amount (in pounds), categoryId (1=Travel, 2=Meals, 3=Supplies, 4=Accommodation, 5=Other), and optionally date and description.
+- get_categories: Get list of expense categories.
+- get_pending_expenses: Get expenses waiting for approval.
+- approve_expense: Approve a pending expense. Requires expenseId.
+
+Business Rules:
+- Expenses cannot exceed £999
+- Travel expenses cannot exceed £99
+- Users cannot submit more than £1500 of expenses within 1 hour
+- If description contains 'train', it's automatically categorized as Travel
+- Weekend expenses are marked with (WEEKEND) in the description
+
+When displaying lists, format them nicely with bullet points or numbered lists.
+Always confirm with the user before creating or modifying data.
+If asked about something outside expense management, politely redirect to expense-related topics.";
+    }
+
+    private static ChatTool GetExpensesTool()
+    {
+        return ChatTool.CreateFunctionTool(
+            "get_expenses",
+            "Retrieves expenses from the database. Can filter by user or search term.",
+            BinaryData.FromString(@"{
+                ""type"": ""object"",
+                ""properties"": {
+                    ""userId"": { ""type"": ""integer"", ""description"": ""Filter by user ID"" },
+                    ""searchTerm"": { ""type"": ""string"", ""description"": ""Search in expense descriptions"" }
+                }
+            }")
+        );
+    }
+
+    private static ChatTool CreateExpenseTool()
+    {
+        return ChatTool.CreateFunctionTool(
+            "create_expense",
+            "Creates a new expense record",
+            BinaryData.FromString(@"{
+                ""type"": ""object"",
+                ""properties"": {
+                    ""userId"": { ""type"": ""integer"", ""description"": ""User ID creating the expense"", ""default"": 1 },
+                    ""categoryId"": { ""type"": ""integer"", ""description"": ""Category ID (1=Travel, 2=Meals, 3=Supplies, 4=Accommodation, 5=Other)"" },
+                    ""amount"": { ""type"": ""number"", ""description"": ""Amount in pounds (e.g., 25.50)"" },
+                    ""date"": { ""type"": ""string"", ""description"": ""Expense date in ISO format (YYYY-MM-DD)"" },
+                    ""description"": { ""type"": ""string"", ""description"": ""Description of the expense"" }
+                },
+                ""required"": [""amount"", ""categoryId""]
+            }")
+        );
+    }
+
+    private static ChatTool GetCategoriesTool()
+    {
+        return ChatTool.CreateFunctionTool(
+            "get_categories",
+            "Gets the list of expense categories",
+            BinaryData.FromString(@"{ ""type"": ""object"", ""properties"": {} }")
+        );
+    }
+
+    private static ChatTool GetPendingExpensesTool()
+    {
+        return ChatTool.CreateFunctionTool(
+            "get_pending_expenses",
+            "Gets expenses that are pending approval",
+            BinaryData.FromString(@"{ ""type"": ""object"", ""properties"": {} }")
+        );
+    }
+
+    private static ChatTool ApproveExpenseTool()
+    {
+        return ChatTool.CreateFunctionTool(
+            "approve_expense",
+            "Approves a pending expense",
+            BinaryData.FromString(@"{
+                ""type"": ""object"",
+                ""properties"": {
+                    ""expenseId"": { ""type"": ""integer"", ""description"": ""ID of the expense to approve"" },
+                    ""reviewerId"": { ""type"": ""integer"", ""description"": ""ID of the manager approving"", ""default"": 2 }
+                },
+                ""required"": [""expenseId""]
+            }")
+        );
     }
 }
