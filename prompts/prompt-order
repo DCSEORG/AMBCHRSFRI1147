@@ -24,6 +24,8 @@ prompt-019-chatui-deploy-file,
 prompt-011-azure-services-diagram,
 prompt-023-deployment-order-considerations
 
+you must delete the whole src folder and create it from scratch
+
 ## CRITICAL: No Shell Scripts
 
 Do NOT create .sh, .bash, or any shell script files. All deployment automation must use PowerShell (.ps1) scripts that work on Windows.
