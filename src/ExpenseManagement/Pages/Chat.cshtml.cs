@@ -5,22 +5,16 @@ namespace ExpenseManagement.Pages;
 
 public class ChatModel : PageModel
 {
-    private readonly IErrorStateService _errorState;
+    private readonly IChatService _chatService;
 
-    public string? ErrorMessage { get; set; }
-    public string? ErrorLocation { get; set; }
+    public bool IsChatConfigured => _chatService.IsConfigured;
 
-    public ChatModel(IErrorStateService errorState)
+    public ChatModel(IChatService chatService)
     {
-        _errorState = errorState;
+        _chatService = chatService;
     }
 
     public void OnGet()
     {
-        if (_errorState.HasError)
-        {
-            ErrorMessage = _errorState.ErrorMessage;
-            ErrorLocation = _errorState.ErrorLocation;
-        }
     }
 }
